@@ -1,0 +1,6 @@
+# labelImg + AI 预检测环境依赖 (Python 3.10)
+# 检测功能仅依赖 onnxruntime + numpy,不依赖 ultralytics/torch/opencv
+PyQt5==5.15.11
+lxml>=4.9
+numpy>=1.24,<3
+onnxruntime>=1.18

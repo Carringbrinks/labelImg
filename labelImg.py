@@ -1,30 +1,16 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
 import codecs
-import distutils.spawn
 import os.path
 import platform
-import re
 import sys
 import subprocess
 
 from functools import partial
-from collections import defaultdict
 
-try:
-    from PyQt5.QtGui import *
-    from PyQt5.QtCore import *
-    from PyQt5.QtWidgets import *
-except ImportError:
-    # needed for py3+qt4
-    # Ref:
-    # http://pyqt.sourceforge.net/Docs/PyQt4/incompatible_apis.html
-    # http://stackoverflow.com/questions/21217399/pyqt4-qtcore-qvariant-object-instead-of-a-string
-    if sys.version_info.major >= 3:
-        import sip
-        sip.setapi('QVariant', 2)
-    from PyQt4.QtGui import *
-    from PyQt4.QtCore import *
+from PyQt5.QtGui import *
+from PyQt5.QtCore import *
+from PyQt5.QtWidgets import *
 
 import resources
 # Add internal libs
@@ -46,18 +32,31 @@ from libs.yolo_io import TXT_EXT
 from libs.ustr import ustr
 from libs.version import __version__
 from libs.hashableQListWidgetItem import HashableQListWidgetItem
+from libs.onnx_detector import OnnxDetector, DetectionManager
 
 __appname__ = 'labelImg'
 
+
+def appDataDir():
+    """Directory holding the bundled data files.
+
+    In a PyInstaller-frozen app, ``__file__`` points inside the PYZ archive
+    (not a real path) and ``sys.argv[0]`` is the exe location, so both are
+    useless for data files. The authoritative location is ``sys._MEIPASS``:
+    the ``_internal`` dir for onedir builds, the temp extraction dir for
+    onefile builds. In source runs this is simply the script directory.
+    """
+    if getattr(sys, 'frozen', False) and hasattr(sys, '_MEIPASS'):
+        return sys._MEIPASS
+    return os.path.dirname(os.path.abspath(__file__))
+
+
+# Default AI detection model (trained library_count yolo26m, exported to ONNX)
+DEFAULT_AI_MODEL_PATH = ('/data/cbsu/Pyproject/ultralytics/library_count/runs/'
+                         'detect/library_count/yolo26m_results_2/weights/best.onnx')
+DEFAULT_AI_CLASSES_PATH = os.path.join(appDataDir(), 'data', 'ai_classes.txt')
+
 # Utility functions and classes.
-
-def have_qstring():
-    '''p3/qt5 get rid of QString wrapper as py3 has native unicode str type'''
-    return not (sys.version_info.major >= 3 or QT_VERSION_STR.startswith('5.'))
-
-def util_qt_strlistclass():
-    return QStringList if have_qstring() else list
-
 
 class WindowMixin(object):
 
@@ -334,6 +333,19 @@ class MainWindow(QMainWindow, WindowMixin):
         self.drawSquaresOption.setChecked(settings.get(SETTING_DRAW_SQUARE, False))
         self.drawSquaresOption.triggered.connect(self.toogleDrawSquare)
 
+        # AI pre-detection
+        self.runAiDetect = action('运行检测', self.runDetectionOnCurrent,
+                                  'Ctrl+P', 'labels',
+                                  '运行AI检测模型,结果作为预标注框载入', enabled=False)
+        self.autoAiDetect = QAction('打开图片自动检测', self)
+        self.autoAiDetect.setCheckable(True)
+        self.autoAiDetect.setChecked(settings.get(SETTING_AI_AUTO, False))
+        self.batchAiDetect = action('批量检测导出', self.batchDetectExport,
+                                    'Ctrl+Shift+D', 'save',
+                                    '对目录中所有图片运行检测并导出YOLO标注')
+        self.aiSettings = action('AI 模型设置...', self.aiSettingsDialog,
+                                 None, 'expert', '设置ONNX模型路径与检测参数')
+
         # Store actions for further handling.
         self.actions = struct(save=save, save_format=save_format, saveAs=saveAs, open=open, close=close, resetAll = resetAll,
                               lineColor=color1, create=create, delete=delete, edit=edit, copy=copy,
@@ -351,7 +363,7 @@ class MainWindow(QMainWindow, WindowMixin):
                               advancedContext=(createMode, editMode, edit, copy,
                                                delete, shapeLineColor, shapeFillColor),
                               onLoadActive=(
-                                  close, create, createMode, editMode),
+                                  close, create, createMode, editMode, self.runAiDetect),
                               onShapesPresent=(saveAs, hideAll, showAll))
 
         self.menus = struct(
@@ -361,6 +373,11 @@ class MainWindow(QMainWindow, WindowMixin):
             help=self.menu('&Help'),
             recentFiles=QMenu('Open &Recent'),
             labelList=labelMenu)
+
+        # AI pre-detection menu
+        self.menus.ai = self.menu('AI 检测')
+        addActions(self.menus.ai, (self.runAiDetect, self.autoAiDetect,
+                                   self.batchAiDetect, None, self.aiSettings))
 
         # Auto saving : Enable auto saving if pressing next
         self.autoSaving = QAction(getStr('autoSaveMode'), self)
@@ -401,7 +418,8 @@ class MainWindow(QMainWindow, WindowMixin):
 
         self.tools = self.toolbar('Tools')
         self.actions.beginner = (
-            open, opendir, changeSavedir, openNextImg, openPrevImg, verify, save, save_format, None, create, copy, delete, None,
+            open, opendir, changeSavedir, openNextImg, openPrevImg, verify, save, save_format, self.runAiDetect, None,
+            create, copy, delete, None,
             zoomIn, zoom, zoomOut, fitWindow, fitWidth)
 
         self.actions.advanced = (
@@ -424,20 +442,35 @@ class MainWindow(QMainWindow, WindowMixin):
         # Add Chris
         self.difficult = False
 
-        ## Fix the compatible issue for qt4 and qt5. Convert the QStringList to python list
-        if settings.get(SETTING_RECENT_FILES):
-            if have_qstring():
-                recentFileQStringList = settings.get(SETTING_RECENT_FILES)
-                self.recentFiles = [ustr(i) for i in recentFileQStringList]
-            else:
-                self.recentFiles = recentFileQStringList = settings.get(SETTING_RECENT_FILES)
+        # AI pre-detection state
+        self.aiModelPath = settings.get(SETTING_AI_MODEL, DEFAULT_AI_MODEL_PATH)
+        self.aiClassesPath = settings.get(SETTING_AI_CLASSES, DEFAULT_AI_CLASSES_PATH)
+        # Merge the AI model classes into the label history first, so the
+        # label popup always lists them and YOLO saves use the model's class
+        # order (spine=0, book shelf=1, main shelf=2).
+        for c in reversed(self.aiClasses()):
+            if c in self.labelHist:
+                self.labelHist.remove(c)
+            self.labelHist.insert(0, c)
+        self.aiConf = settings.get(SETTING_AI_CONF, 0.25)
+        self.aiIou = settings.get(SETTING_AI_IOU, 0.45)
+        self.aiDevice = settings.get(SETTING_AI_DEVICE, 'CPU')
+        self.detector = None      # lazy OnnxDetector, rebuilt on settings change
+        self.detectManager = None  # persistent worker-thread manager
+        self.detecting = False
+        self._lastAutoDetectedPath = None  # avoid duplicate auto detection
+
+        # Fix the compatible issue for qt4 and qt5. Convert the QStringList to python list
+        recentFiles = settings.get(SETTING_RECENT_FILES)
+        if recentFiles:
+            self.recentFiles = [ustr(i) for i in recentFiles]
 
         size = settings.get(SETTING_WIN_SIZE, QSize(600, 500))
         position = QPoint(0, 0)
         saved_position = settings.get(SETTING_WIN_POSE, position)
         # Fix the multiple monitors issue
-        for i in range(QApplication.desktop().screenCount()):
-            if QApplication.desktop().availableGeometry(i).contains(saved_position):
+        for screen in QGuiApplication.screens():
+            if screen.availableGeometry().contains(saved_position):
                 position = saved_position
                 break
         self.resize(size)
@@ -457,12 +490,7 @@ class MainWindow(QMainWindow, WindowMixin):
         # Add chris
         Shape.difficult = self.difficult
 
-        def xbool(x):
-            if isinstance(x, QVariant):
-                return x.toBool()
-            return bool(x)
-
-        if xbool(settings.get(SETTING_ADVANCE_MODE, False)):
+        if settings.get(SETTING_ADVANCE_MODE, False):
             self.actions.advancedMode.setChecked(True)
             self.toggleAdvancedMode()
 
@@ -755,8 +783,12 @@ class MainWindow(QMainWindow, WindowMixin):
 
     def loadLabels(self, shapes):
         s = []
-        for label, points, line_color, fill_color, difficult in shapes:
+        for item in shapes:
+            # Optional 6th element: line width multiplier (AI detections)
+            label, points, line_color, fill_color, difficult = item[:5]
             shape = Shape(label=label)
+            if len(item) > 5:
+                shape.line_width = item[5]
             for x, y in points:
                 shape.addPoint(QPointF(x, y))
             shape.difficult = difficult
@@ -880,16 +912,18 @@ class MainWindow(QMainWindow, WindowMixin):
     def scrollRequest(self, delta, orientation):
         units = - delta / (8 * 15)
         bar = self.scrollBars[orientation]
-        bar.setValue(bar.value() + bar.singleStep() * units)
+        # PyQt5 5.15 rejects float for QScrollBar.setValue (older 5.x truncated
+        # implicitly), so convert explicitly.
+        bar.setValue(int(bar.value() + bar.singleStep() * units))
 
     def setZoom(self, value):
         self.actions.fitWidth.setChecked(False)
         self.actions.fitWindow.setChecked(False)
         self.zoomMode = self.MANUAL_ZOOM
-        self.zoomWidget.setValue(value)
+        self.zoomWidget.setValue(int(value))
 
     def addZoom(self, increment=10):
-        self.setZoom(self.zoomWidget.value() + increment)
+        self.setZoom(self.zoomWidget.value() + int(increment))
 
     def zoomRequest(self, delta):
         # get the current scrollbar positions
@@ -940,8 +974,8 @@ class MainWindow(QMainWindow, WindowMixin):
         new_h_bar_value = h_bar.value() + move_x * d_h_bar_max
         new_v_bar_value = v_bar.value() + move_y * d_v_bar_max
 
-        h_bar.setValue(new_h_bar_value)
-        v_bar.setValue(new_v_bar_value)
+        h_bar.setValue(int(new_h_bar_value))
+        v_bar.setValue(int(new_v_bar_value))
 
     def setFitWindow(self, value=True):
         if value:
@@ -1049,6 +1083,10 @@ class MainWindow(QMainWindow, WindowMixin):
                 self.labelList.item(self.labelList.count()-1).setSelected(True)
 
             self.canvas.setFocus(True)
+
+            # AI pre-detection on open (only when no annotation was loaded)
+            if self.autoAiDetect.isChecked() and not self.canvas.shapes:
+                self.runDetectionOnCurrent(silent=True)
             return True
         return False
 
@@ -1116,6 +1154,14 @@ class MainWindow(QMainWindow, WindowMixin):
         settings[SETTING_SINGLE_CLASS] = self.singleClassMode.isChecked()
         settings[SETTING_PAINT_LABEL] = self.displayLabelOption.isChecked()
         settings[SETTING_DRAW_SQUARE] = self.drawSquaresOption.isChecked()
+        settings[SETTING_AI_MODEL] = self.aiModelPath or ''
+        settings[SETTING_AI_CLASSES] = self.aiClassesPath or ''
+        settings[SETTING_AI_CONF] = self.aiConf
+        settings[SETTING_AI_IOU] = self.aiIou
+        settings[SETTING_AI_DEVICE] = self.aiDevice
+        settings[SETTING_AI_AUTO] = self.autoAiDetect.isChecked()
+        if self.detectManager is not None:
+            self.detectManager.shutdown()
         settings.save()
 
     def loadRecent(self, filename):
@@ -1335,7 +1381,11 @@ class MainWindow(QMainWindow, WindowMixin):
         self.settings.reset()
         self.close()
         proc = QProcess()
-        proc.startDetached(os.path.abspath(__file__))
+        # In a frozen app, relaunch the exe itself, not the bundled script.
+        if getattr(sys, 'frozen', False):
+            proc.startDetached(sys.executable)
+        else:
+            proc.startDetached(os.path.abspath(__file__))
 
     def mayContinue(self):
         return not (self.dirty and not self.discardChangesDialog())
@@ -1395,7 +1445,7 @@ class MainWindow(QMainWindow, WindowMixin):
         self.setDirty()
 
     def loadPredefinedClasses(self, predefClassesFile):
-        if os.path.exists(predefClassesFile) is True:
+        if predefClassesFile and os.path.exists(predefClassesFile) is True:
             with codecs.open(predefClassesFile, 'r', 'utf8') as f:
                 for line in f:
                     line = line.strip()
@@ -1426,7 +1476,6 @@ class MainWindow(QMainWindow, WindowMixin):
         self.set_format(FORMAT_YOLO)
         tYoloParseReader = YoloReader(txtPath, self.image)
         shapes = tYoloParseReader.getShapes()
-        print (shapes)
         self.loadLabels(shapes)
         self.canvas.verified = tYoloParseReader.verified
 
@@ -1436,6 +1485,359 @@ class MainWindow(QMainWindow, WindowMixin):
 
     def toogleDrawSquare(self):
         self.canvas.setDrawingShapeToSquare(self.drawSquaresOption.isChecked())
+
+    # ------------------------------------------------------ AI pre-detection
+
+    def aiEffectiveClassesPath(self):
+        """Resolve the classes file, falling back to the bundled default.
+
+        Handles stale settings pointing at a nonexistent file (e.g. a path
+        saved on another machine or from an older build).
+        """
+        candidates = [self.aiClassesPath, DEFAULT_AI_CLASSES_PATH,
+                      os.path.join(appDataDir(), 'data', 'ai_classes.txt')]
+        for p in candidates:
+            if p and os.path.isfile(p):
+                return p
+        return self.aiClassesPath
+
+    def aiClasses(self):
+        """Load model class names from the configured classes file."""
+        classesPath = self.aiEffectiveClassesPath()
+        classes = []
+        if classesPath and os.path.isfile(classesPath):
+            try:
+                with open(classesPath, 'r', encoding='utf-8') as f:
+                    for line in f:
+                        line = line.strip()
+                        if line:
+                            classes.append(line)
+            except IOError:
+                pass
+        return classes
+
+    def aiEffectiveModelPath(self):
+        """Resolve the model path, falling back to exe-adjacent locations.
+
+        Windows builds ship best.onnx next to the executable; this lets the
+        same code run on Linux (hardcoded default) and on a packaged exe
+        without touching the settings dialog.
+        """
+        candidates = []
+        if self.aiModelPath:
+            candidates.append(self.aiModelPath)
+        if getattr(sys, 'frozen', False):
+            baseDir = os.path.dirname(sys.executable)
+        else:
+            baseDir = os.path.dirname(os.path.abspath(__file__))
+        for rel in ('best.onnx', 'model/best.onnx'):
+            candidates.append(os.path.join(baseDir, rel))
+        for p in candidates:
+            if p and os.path.isfile(p):
+                return p
+        return self.aiModelPath
+
+    def aiEnsureDetector(self):
+        """Return the (lazily built) OnnxDetector, rebuilt on settings change."""
+        modelPath = self.aiEffectiveModelPath()
+        if self.detector is None or \
+                self.detector.model_path != modelPath or \
+                self.detector.device != self.aiDevice or \
+                self.detector.conf_thres != self.aiConf or \
+                self.detector.iou_thres != self.aiIou:
+            self.detector = OnnxDetector(modelPath,
+                                         classes=self.aiClasses(),
+                                         conf_thres=self.aiConf,
+                                         iou_thres=self.aiIou,
+                                         device=self.aiDevice)
+        return self.detector
+
+    def runDetectionOnCurrent(self, _value=False, silent=False):
+        """Run AI detection on the current image and load results as shapes."""
+        if self.detecting:
+            return
+        if self.filePath is None or self.imageData is None:
+            self.status('请先打开一张图片再运行检测')
+            return
+        modelPath = self.aiEffectiveModelPath()
+        if not modelPath or not os.path.isfile(modelPath):
+            self.status('AI模型文件不存在: %s (请在 "AI 检测 -> AI 模型设置" 中配置)'
+                        % modelPath)
+            return
+        # Automatic detection never disturbs existing annotations: it is
+        # only triggered for images that have no shapes yet.  The manual
+        # run below always replaces whatever is on the canvas (no prompt).
+        if silent and self.canvas.shapes:
+            return
+        try:
+            detector = self.aiEnsureDetector()
+        except Exception as e:
+            self.errorMessage('AI检测初始化失败', str(e))
+            return
+        if self.detectManager is None:
+            self.detectManager = DetectionManager(self)
+            self.detectManager.worker.resultReady.connect(self.onDetectionResult)
+            self.detectManager.worker.batchFinished.connect(self.onBatchFinished)
+            self.detectManager.worker.errorOccurred.connect(self.onDetectionError)
+        if silent:
+            self._lastAutoDetectedPath = self.filePath
+        self.detecting = True
+        self.runAiDetect.setEnabled(False)
+        self.status('正在运行AI检测... (首次运行需加载模型,请稍候)')
+        self.detectManager.setDetector(detector)
+        self.detectManager.runSingle(self.filePath, self.imageData)
+
+    def clearShapes(self):
+        """Remove all shapes currently on the canvas."""
+        # Drop any selection/hover state that still points at the old
+        # shapes; otherwise a stale hShape/hVertex could keep receiving
+        # vertex drags after the canvas has been repopulated.
+        self.canvas.deSelectShape()
+        if self.canvas.hShape is not None:
+            self.canvas.hShape.highlightClear()
+        self.canvas.hVertex, self.canvas.hShape = None, None
+        for shape in list(self.canvas.shapes):
+            self.remLabel(shape)
+        self.canvas.loadShapes([])
+
+    def onDetectionResult(self, payload):
+        self.detecting = False
+        if payload['filePath'] != self.filePath:
+            # The user navigated away while detection was running.
+            self.status('检测结果已过期(图片已切换),已丢弃')
+            self.runAiDetect.setEnabled(self.filePath is not None)
+            self.maybeAutoDetect()
+            return
+        self.runAiDetect.setEnabled(True)
+        detections = payload['detections']
+        classes = self.aiClasses()
+        # Hard-coded replace behaviour: detection results always replace
+        # the annotations currently on the canvas.  Clearing happens only
+        # once the results are in, so a failed detection keeps the
+        # existing annotations untouched.
+        hadShapes = bool(self.canvas.shapes)
+        if hadShapes:
+            self.clearShapes()
+        self.loadLabels([d.asShape(classes) for d in detections])
+        for d in detections:
+            if d.label not in self.labelHist:
+                self.labelHist.append(d.label)
+        if hadShapes or detections:
+            self.setDirty()
+        self.status('AI检测完成: %d 个目标 (耗时 %.0f ms)'
+                    % (len(detections), payload['elapsed_ms']))
+        self.maybeAutoDetect()
+
+    def onDetectionError(self, msg):
+        self.detecting = False
+        self.runAiDetect.setEnabled(self.filePath is not None)
+        self.status('AI检测失败: %s' % msg)
+        self.maybeAutoDetect()
+
+    def maybeAutoDetect(self):
+        """Catch up on auto detection missed because a run was in flight
+        when the image was opened (e.g. fast navigation)."""
+        if self.autoAiDetect.isChecked() and self.filePath \
+                and not self.canvas.shapes and not self.detecting \
+                and self._lastAutoDetectedPath != self.filePath:
+            self.runDetectionOnCurrent(silent=True)
+
+    def batchDetectExport(self, _value=False):
+        """Run detection over all images in the open directory and export txt."""
+        if self.detecting:
+            return
+        if not self.mImgList:
+            QMessageBox.information(self, '批量检测导出',
+                                    '请先用 "打开目录" 打开图片所在文件夹')
+            return
+        modelPath = self.aiEffectiveModelPath()
+        if not modelPath or not os.path.isfile(modelPath):
+            self.status('AI模型文件不存在: %s (请在 "AI 检测 -> AI 模型设置" 中配置)'
+                        % modelPath)
+            return
+        defaultDir = self.defaultSaveDir \
+            if (self.defaultSaveDir and len(ustr(self.defaultSaveDir))) \
+            else os.path.dirname(self.mImgList[0])
+        dlg = BatchDetectDialog(self, defaultDir)
+        if dlg.exec_() != QDialog.Accepted:
+            return
+        outDir = dlg.outDir()
+        if not outDir:
+            self.status('输出目录为空,已取消')
+            return
+        try:
+            os.makedirs(outDir, exist_ok=True)
+            detector = self.aiEnsureDetector()
+        except Exception as e:
+            self.errorMessage('AI检测初始化失败', str(e))
+            return
+        if self.detectManager is None:
+            self.detectManager = DetectionManager(self)
+            self.detectManager.worker.resultReady.connect(self.onDetectionResult)
+            self.detectManager.worker.batchFinished.connect(self.onBatchFinished)
+            self.detectManager.worker.errorOccurred.connect(self.onDetectionError)
+        progress = QProgressDialog('批量检测中...', '取消', 0, len(self.mImgList), self)
+        progress.setWindowTitle('批量检测导出')
+        progress.setWindowModality(Qt.WindowModal)
+        progress.setMinimumDuration(0)
+        self._batchProgress = progress
+        self.detecting = True
+        progress.canceled.connect(self.detectManager.cancel)
+        progress.show()
+        self.detectManager.setDetector(detector)
+        self.detectManager.runBatch(self.mImgList, outDir,
+                                    saveTxt=True, savePreview=dlg.savePreview())
+
+    def onBatchFinished(self, payload):
+        self.detecting = False
+        progress = getattr(self, '_batchProgress', None)
+        if progress is not None:
+            progress.close()
+            self._batchProgress = None
+        if payload['canceled']:
+            msg = '批量检测已取消: %d/%d 张图片\n输出目录: %s' % (
+                payload['done'], payload['total'], payload['outDir'])
+        else:
+            msg = '批量检测完成: %d/%d 张图片, 共 %d 个目标\n输出目录: %s' % (
+                payload['done'], payload['total'], payload['boxCount'], payload['outDir'])
+        if payload['failed']:
+            msg += '\n\n失败 %d 张:\n%s' % (len(payload['failed']),
+                                           '\n'.join(payload['failed'][:20]))
+        QMessageBox.information(self, '批量检测导出', msg)
+        self.status(msg.split('\n')[0])
+        self.maybeAutoDetect()
+
+    def aiSettingsDialog(self, _value=False):
+        dlg = AiSettingsDialog(self, self.aiModelPath or '', self.aiClassesPath or '',
+                               self.aiConf, self.aiIou, self.aiDevice)
+        if dlg.exec_() != QDialog.Accepted:
+            return
+        v = dlg.values()
+        self.aiModelPath = v['modelPath']
+        self.aiClassesPath = v['classesPath']
+        self.aiConf = v['conf']
+        self.aiIou = v['iou']
+        self.aiDevice = v['device']
+        self.detector = None  # rebuild on next use
+        self.status('AI设置已更新: %s (conf=%.2f iou=%.2f %s)'
+                    % (self.aiModelPath, self.aiConf, self.aiIou, self.aiDevice))
+
+class BatchDetectDialog(QDialog):
+    """Ask for the output directory and preview option of a batch export."""
+
+    def __init__(self, parent=None, defaultOutDir=''):
+        super(BatchDetectDialog, self).__init__(parent)
+        self.setWindowTitle('批量检测导出')
+        layout = QVBoxLayout(self)
+        form = QFormLayout()
+        self.outDirEdit = QLineEdit(defaultOutDir)
+        browseBtn = QPushButton('浏览...')
+        browseBtn.clicked.connect(self.browseOutDir)
+        dirRow = QHBoxLayout()
+        dirRow.addWidget(self.outDirEdit)
+        dirRow.addWidget(browseBtn)
+        form.addRow('输出目录:', dirRow)
+        self.previewCheck = QCheckBox('同时保存检测预览图(输出到 preview/ 子目录)')
+        form.addRow(self.previewCheck)
+        layout.addLayout(form)
+        bb = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        bb.accepted.connect(self.accept)
+        bb.rejected.connect(self.reject)
+        layout.addWidget(bb)
+
+    def browseOutDir(self):
+        path = QFileDialog.getExistingDirectory(
+            self, '选择输出目录', self.outDirEdit.text() or '.',
+            QFileDialog.ShowDirsOnly | QFileDialog.DontResolveSymlinks)
+        if path:
+            self.outDirEdit.setText(path)
+
+    def outDir(self):
+        return self.outDirEdit.text().strip()
+
+    def savePreview(self):
+        return self.previewCheck.isChecked()
+
+
+class AiSettingsDialog(QDialog):
+    """Configure the ONNX model path and detection parameters."""
+
+    def __init__(self, parent=None, modelPath='', classesPath='', conf=0.25,
+                 iou=0.45, device='CPU'):
+        super(AiSettingsDialog, self).__init__(parent)
+        self.setWindowTitle('AI 检测模型设置')
+        layout = QVBoxLayout(self)
+        form = QFormLayout()
+
+        self.modelEdit = QLineEdit(modelPath)
+        modelBrowse = QPushButton('浏览...')
+        modelBrowse.clicked.connect(self.browseModel)
+        modelRow = QHBoxLayout()
+        modelRow.addWidget(self.modelEdit)
+        modelRow.addWidget(modelBrowse)
+        form.addRow('ONNX 模型:', modelRow)
+
+        self.classesEdit = QLineEdit(classesPath)
+        classesBrowse = QPushButton('浏览...')
+        classesBrowse.clicked.connect(self.browseClasses)
+        classesRow = QHBoxLayout()
+        classesRow.addWidget(self.classesEdit)
+        classesRow.addWidget(classesBrowse)
+        form.addRow('类别文件:', classesRow)
+
+        self.confSpin = QDoubleSpinBox()
+        self.confSpin.setRange(0.0, 1.0)
+        self.confSpin.setSingleStep(0.05)
+        self.confSpin.setDecimals(2)
+        self.confSpin.setValue(conf)
+        form.addRow('置信度阈值:', self.confSpin)
+
+        self.iouSpin = QDoubleSpinBox()
+        self.iouSpin.setRange(0.0, 1.0)
+        self.iouSpin.setSingleStep(0.05)
+        self.iouSpin.setDecimals(2)
+        self.iouSpin.setValue(iou)
+        form.addRow('IoU 阈值:', self.iouSpin)
+
+        self.deviceCombo = QComboBox()
+        self.deviceCombo.addItem('CPU')
+        try:
+            import onnxruntime as ort
+            if 'CUDAExecutionProvider' in ort.get_available_providers():
+                self.deviceCombo.addItem('CUDA')
+        except ImportError:
+            pass
+        if device.upper() == 'CUDA' and self.deviceCombo.count() > 1:
+            self.deviceCombo.setCurrentText('CUDA')
+        form.addRow('运行设备:', self.deviceCombo)
+
+        layout.addLayout(form)
+        bb = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        bb.accepted.connect(self.accept)
+        bb.rejected.connect(self.reject)
+        layout.addWidget(bb)
+
+    def browseModel(self):
+        path, _ = QFileDialog.getOpenFileName(
+            self, '选择ONNX模型文件', self.modelEdit.text() or '.',
+            'ONNX model (*.onnx)')
+        if path:
+            self.modelEdit.setText(path)
+
+    def browseClasses(self):
+        path, _ = QFileDialog.getOpenFileName(
+            self, '选择类别文件', self.classesEdit.text() or '.',
+            'Text file (*.txt)')
+        if path:
+            self.classesEdit.setText(path)
+
+    def values(self):
+        return dict(modelPath=self.modelEdit.text().strip(),
+                    classesPath=self.classesEdit.text().strip(),
+                    conf=self.confSpin.value(),
+                    iou=self.iouSpin.value(),
+                    device=self.deviceCombo.currentText())
+
 
 def inverted(color):
     return QColor(*[255 - v for v in color.getRgb()])
@@ -1461,8 +1863,7 @@ def get_main_app(argv=[]):
     # Usage : labelImg.py image predefClassFile saveDir
     win = MainWindow(argv[1] if len(argv) >= 2 else None,
                      argv[2] if len(argv) >= 3 else os.path.join(
-                         os.path.dirname(sys.argv[0]),
-                         'data', 'predefined_classes.txt'),
+                         appDataDir(), 'data', 'ai_classes.txt'),
                      argv[3] if len(argv) >= 4 else None)
     win.show()
     return app, win

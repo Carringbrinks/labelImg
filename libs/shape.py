@@ -2,12 +2,8 @@
 # -*- coding: utf-8 -*-
 
 
-try:
-    from PyQt5.QtGui import *
-    from PyQt5.QtCore import *
-except ImportError:
-    from PyQt4.QtGui import *
-    from PyQt4.QtCore import *
+from PyQt5.QtGui import *
+from PyQt5.QtCore import *
 
 from libs.lib import distance
 import sys
@@ -16,6 +12,7 @@ DEFAULT_LINE_COLOR = QColor(0, 255, 0, 128)
 DEFAULT_FILL_COLOR = QColor(255, 0, 0, 128)
 DEFAULT_SELECT_LINE_COLOR = QColor(255, 255, 255)
 DEFAULT_SELECT_FILL_COLOR = QColor(0, 128, 255, 155)
+DEFAULT_HOVER_FILL_COLOR = QColor(255, 190, 0, 120)
 DEFAULT_VERTEX_FILL_COLOR = QColor(0, 255, 0, 255)
 DEFAULT_HVERTEX_FILL_COLOR = QColor(255, 0, 0)
 MIN_Y_LABEL = 10
@@ -32,6 +29,7 @@ class Shape(object):
     fill_color = DEFAULT_FILL_COLOR
     select_line_color = DEFAULT_SELECT_LINE_COLOR
     select_fill_color = DEFAULT_SELECT_FILL_COLOR
+    hover_fill_color = DEFAULT_HOVER_FILL_COLOR
     vertex_fill_color = DEFAULT_VERTEX_FILL_COLOR
     hvertex_fill_color = DEFAULT_HVERTEX_FILL_COLOR
     point_type = P_ROUND
@@ -45,6 +43,9 @@ class Shape(object):
         self.selected = False
         self.difficult = difficult
         self.paintLabel = paintLabel
+        # Multiplier on the default pen width (detection results use a
+        # thicker outline so they stand out from manual annotations).
+        self.line_width = 1.0
 
         self._highlightIndex = None
         self._highlightMode = self.NEAR_VERTEX
@@ -89,7 +90,7 @@ class Shape(object):
             color = self.select_line_color if self.selected else self.line_color
             pen = QPen(color)
             # Try using integer sizes for smoother drawing(?)
-            pen.setWidth(max(1, int(round(2.0 / self.scale))))
+            pen.setWidth(max(1, int(round(2.0 * self.line_width / self.scale))))
             painter.setPen(pen)
 
             line_path = QPainterPath()
@@ -127,10 +128,12 @@ class Shape(object):
                         self.label = ""
                     if(min_y < MIN_Y_LABEL):
                         min_y += MIN_Y_LABEL
-                    painter.drawText(min_x, min_y, self.label)
+                    # PyQt5 5.15 rejects float coords for the int drawText
+                    # overload; use the QPointF overload instead.
+                    painter.drawText(QPointF(min_x, min_y), self.label)
 
             if self.fill:
-                color = self.select_fill_color if self.selected else self.fill_color
+                color = self.select_fill_color if self.selected else self.hover_fill_color
                 painter.fillPath(line_path, color)
 
     def drawVertex(self, path, i):
@@ -188,6 +191,7 @@ class Shape(object):
         shape.fill = self.fill
         shape.selected = self.selected
         shape._closed = self._closed
+        shape.line_width = self.line_width
         if self.line_color != Shape.line_color:
             shape.line_color = self.line_color
         if self.fill_color != Shape.fill_color:

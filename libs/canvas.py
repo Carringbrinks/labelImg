@@ -1,13 +1,7 @@
 
-try:
-    from PyQt5.QtGui import *
-    from PyQt5.QtCore import *
-    from PyQt5.QtWidgets import *
-except ImportError:
-    from PyQt4.QtGui import *
-    from PyQt4.QtCore import *
-
-#from PyQt4.QtOpenGL import *
+from PyQt5.QtGui import *
+from PyQt5.QtCore import *
+from PyQt5.QtWidgets import *
 
 from libs.shape import Shape
 from libs.lib import distance
@@ -451,12 +445,17 @@ class Canvas(QWidget):
             p.setPen(self.drawingRectColor)
             brush = QBrush(Qt.BDiagPattern)
             p.setBrush(brush)
-            p.drawRect(leftTop.x(), leftTop.y(), rectWidth, rectHeight)
+            # PyQt5 5.15 rejects float coords for the int drawRect overload.
+            p.drawRect(QRectF(leftTop.x(), leftTop.y(), rectWidth, rectHeight))
 
         if self.drawing() and not self.prevPoint.isNull() and not self.outOfPixmap(self.prevPoint):
             p.setPen(QColor(0, 0, 0))
-            p.drawLine(self.prevPoint.x(), 0, self.prevPoint.x(), self.pixmap.height())
-            p.drawLine(0, self.prevPoint.y(), self.pixmap.width(), self.prevPoint.y())
+            # PyQt5 5.15 rejects float coords for the int drawLine overload;
+            # the QLineF overload takes floats.
+            p.drawLine(QLineF(self.prevPoint.x(), 0,
+                              self.prevPoint.x(), self.pixmap.height()))
+            p.drawLine(QLineF(0, self.prevPoint.y(),
+                              self.pixmap.width(), self.prevPoint.y()))
 
         self.setAutoFillBackground(True)
         if self.verified:

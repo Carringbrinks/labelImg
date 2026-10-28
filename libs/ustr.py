@@ -1,15 +1,12 @@
 import sys
-from libs.constants import DEFAULT_ENCODING
+
 
 def ustr(x):
-    '''py2/py3 unicode helper'''
+    """py3 unicode passthrough helper (kept for API compatibility).
 
-    if sys.version_info < (3, 0, 0):
-        from PyQt4.QtCore import QString
-        if type(x) == str:
-            return x.decode(DEFAULT_ENCODING)
-        if type(x) == QString:
-            return unicode(x)
+    Qt5 has no QString wrapper: strings arrive as native str. None passes
+    through untouched so that callers can keep their None checks.
+    """
+    if x is None or isinstance(x, str):
         return x
-    else:
-        return x
+    return str(x)

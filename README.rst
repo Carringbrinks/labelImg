@@ -189,7 +189,7 @@ You can refer to the below hotkeys to speed up your workflow.
 Steps (YOLO)
 ~~~~~
 
-1. In ``data/predefined_classes.txt`` define the list of classes that will be used for your training.
+1. In ``data/ai_classes.txt`` define the list of classes that will be used for your training.
 
 2. Build and launch using the instructions above.
 
@@ -211,8 +211,37 @@ Create pre-defined classes
 ~~~~~~~~~~~~~~~~~~~~~~~~~~
 
 You can edit the
-`data/predefined\_classes.txt <https://github.com/tzutalin/labelImg/blob/master/data/predefined_classes.txt>`__
+``data/ai_classes.txt``
 to load pre-defined classes
+
+AI 预检测 (AI pre-detection)
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+This fork can run an ONNX detection model (exported with Ultralytics, no
+NMS embedded) on the current image and load the results as pre-annotated
+boxes for manual review. It only depends on ``onnxruntime`` + ``numpy`` —
+no ultralytics / torch / opencv needed.
+
+1. Install the dependencies: ``pip install -r requirements.txt``.
+
+2. Launch and open ``AI 检测 -> AI 模型设置`` to select your ``.onnx``
+   model file, the class-name file (``data/ai_classes.txt`` by default, one
+   class per line, in the same order as the model's class indices), the
+   confidence/IoU thresholds and the device (CPU/CUDA).
+
+3. Use ``运行检测`` (Ctrl+P) on the current image, or check
+   ``打开图片自动检测`` to run it automatically on every image that has no
+   existing annotation. A manual run always replaces the boxes currently
+   on the canvas with the detection results (no confirmation prompt); an
+   automatic run only happens when the image has no boxes yet. The
+   detection boxes are ordinary shapes: edit, delete and save them as
+   usual.
+
+4. ``批量检测导出`` (Ctrl+Shift+D) runs detection over every image of the
+   opened directory and exports one YOLO ``.txt`` per image plus a
+   ``classes.txt`` (class indices follow the model's class file order, so
+   the result is directly usable for training). Optionally a boxed preview
+   image is saved under ``preview/``.
 
 Hotkeys
 ~~~~~~~

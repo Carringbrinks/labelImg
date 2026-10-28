@@ -3,17 +3,10 @@
 import re
 import resources
 import os
-import sys
 import locale
 from libs.ustr import ustr
 
-try:
-    from PyQt5.QtCore import *
-except ImportError:
-    if sys.version_info.major >= 3:
-        import sip
-        sip.setapi('QVariant', 2)
-    from PyQt4.QtCore import *
+from PyQt5.QtCore import *
 
 DEFAULT_LOCALE = locale.getlocale()[0] if locale.getlocale() and len(locale.getlocale()) > 0 else os.getenv('LANG')
 
